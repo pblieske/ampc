@@ -1,0 +1,1305 @@
+---
+title: "Target Trial Emulation"
+format: 
+  html:
+    embed-resources: true
+    self-contained-math: true
+editor: source
+page-layout: full
+---
+
+# Set-up paths and read in data
+
+```{r}
+#| echo: false
+#| output: false
+
+#--------------------------------------------------
+# Prepare the environment and load the data
+#--------------------------------------------------
+
+rm(list=ls())   # Ensure that memory is empty
+
+# Paths
+path="\\\\fs-home/blipi$/Documents/"    
+path_data=paste0(path, "surveillance_data/")          # path where "raw" surveillance files can be found
+path_prep=paste0(path, "surveillance_preprocessed/")  # path where "preprocessed" surveillance files can be found
+path_dict=paste0(path, "repo/Antibiotic_resistance_surveillance_eth/pio/dictionaries/")   # path where dictionaries for encoding antibiotics, sample material and pathogens are found
+
+# Load the packages
+invisible(lapply(c("ggplot2", "ggcorrplot", "tidyverse", "lubridate", "WeightIt", "MatchIt", "survival", "cobalt", "patchwork", "gtsummary"), library, character.only=T))
+# Load the utils functions
+source(paste(path, "repo/Antibiotic_resistance_surveillance_eth/pio/ampc_target_trial/utils.R", sep=""))
+select=dplyr::select   # Make sure that select from the dplyr package is not overwritten by the MASS package
+
+# Read the data files
+encounter=readRDS(paste0(path_prep, "encounter_data_preprocessed.RDS")) %>% unique()
+toread=c("df_test"="test_ampc_seq", "df_test_all"="test_ampc", "df_treat"="treatment_ampc_temp", "df_imm"="df_imm", "df_con"="df_con", "df_departement"="df_departement", "df_exposure"="df_exposure", "df_test_other"="test_non_ampc", "df_sofa"="df_sofa")
+for (df in names(toread)){
+  assign(df, readRDS(file=paste0(path_prep, "ampc/", toread[df], ".RDS")))
+}
+
+# Read the dictionaries
+ATCKEYs=df_treat %>% pull(ATCKEY) %>% unique()
+dict_treat=read.csv(paste0(path_dict, "anti_ampc.csv"), sep=";")
+dict_test=read.csv(paste0(path_dict, "test_ampc.csv"), sep=";")
+
+```
+
+
+## Subpopulation
+Decide if the analysis should be performed for all high risk species or only for species with high mutation rates. Per default, analysis is performed for all.
+
+```{r}
+#| echo: false
+
+# Set high_mutation to true for the subpopulation analysis of  enterobacter cloacae, citrobacte freundii, and klebsiella aerogenes
+high_mutation=F
+
+```
+
+
+## Restructure the data
+
+Construct the data frame containing all variables of interest and apply the eligibility criteria.
+```{r}
+#| echo: false
+#| warning: false
+
+#--------------------------------------------------
+# Get all factor levels for the sample material and species
+#--------------------------------------------------
+if(high_mutation){species = c("enterobacter cloacae", "citrobacter freundii", "klebsiella aerogenes")}else{species=df_test$bacteria %>% unique()}
+materials=df_test$category %>% unique()
+
+# Take only high mutaters if subpopulation analysis is done
+df_test=df_test %>% filter(bacteria %in% species)
+
+# Remove strains carrying ESBL
+df_test = df_test %>% 
+  filter(!(encounter_pseudo_id %in% (df_test_all %>% filter(bacteria %in% species & esbl) %>% pull(encounter_pseudo_id))))
+
+# Bring the data into a wide format
+df_mat=df_test %>% select(encounter_pseudo_id, dttm_min, category) %>% unique() %>% mutate(positive=T) %>%
+  pivot_wider(names_from=category, values_from = positive) 
+
+df_spec=df_test %>% select(encounter_pseudo_id, dttm_min,  bacteria) %>% unique() %>% mutate(positive=T) %>%
+  pivot_wider(names_from=bacteria, values_from = positive) 
+
+# Combine the material and species information in one data frame
+df_empirical = df_mat %>% full_join(df_spec, by=c("encounter_pseudo_id", "dttm_min")) %>%
+  group_by(encounter_pseudo_id) %>% arrange(dttm_min) %>%  rename(dttm=dttm_min) %>% ungroup() 
+
+# Make a copy for later
+df_empirical_all=df_empirical
+
+rm(list=c("df_spec", "df_mat"))
+
+# Take the first positive test for each encounter
+df_empirical=df_empirical %>% summarise(dttm=min(dttm), .by="encounter_pseudo_id") %>% mutate(first=T) %>%
+  left_join(df_empirical, by=c("encounter_pseudo_id", "dttm")) %>% filter(!is.na(first)) %>%
+  replace(is.na(.), F) %>% select(-first) %>% mutate(date=as.Date(dttm)) %>%
+  rename(dttm_test=dttm)
+
+# Take only inpatients
+df_empirical = df_empirical %>% filter(encounter_pseudo_id %in% (encounter %>% filter(encounter_type=="S") %>% pull(encounter_pseudo_id)))
+print(paste0("Total number of encounters with at least one positive test for ESCPM: ", nrow(df_empirical)))
+
+df_con = df_con %>% filter(encounter_pseudo_id %in% df_test$encounter_pseudo_id)
+
+# Take only encounter over the age of 18 years
+df_empirical=df_empirical %>% left_join(df_con, by="encounter_pseudo_id") %>% filter(age>=18)
+print(paste0("Patients over 18 years: ", nrow(df_empirical)))
+
+
+#--------------------------------------------------
+# Prepare the treatment and immunology dataframe
+#--------------------------------------------------
+
+# Add the arms to the treatment data frame and keep only the treated entries
+df_treat=df_treat %>% filter(treated) %>% left_join(dict_treat %>% select(ATCKEY, arm, oral), by="ATCKEY") %>% replace_na(list(arm=4)) 
+antibiotics=df_treat %>% filter(anti_name!="others") %>% pull(anti_name) %>% unique()
+
+# Replace missing dates
+df_imm=df_imm %>% mutate(dttm=if_else(dttm=="NULL", ObservationEndDtTm, dttm))
+
+# Rename columns of the dataframe for multimicrobial infections
+df_test_other = df_test_other %>% rename(dttm=sample_collection_at_ward_dttm)
+
+```
+
+
+# Clinical outcomes
+
+In this section, we emulate the first target trial investigating the clinical outcomes like length of stay, mortality, and ICU admissions.
+
+
+## Preprocessing
+
+Prepare the dataframes for the empirical treatment and definitive treatment.
+
+```{r}
+#| echo: false
+
+# Prepare the formula for the weighting
+patient_encounter=c("age", "sex", "bmi", "charlson", "ips")
+species=gsub(" ", "_", species) %>% gsub("\\.", "", .)
+imm_var=c("leukozyten", "crp", "lymphozyten", "neutrophile", "pct")
+imm_var_gen=c("leukozyten", "crp")
+
+# Combine infection sites for which we have less than 10 observations in a rest category
+remove=c("heart", "lymph", "eyes", "lung", "implants_foreign_material", "central_nervous_system", "skin", "mucosa", "female_reproductive_organs", "installation")
+materials=c(materials[!(materials %in% remove)], "other")
+remove_icu=c("bones_joints", "pus", "installation", "abdomen")
+
+prep_df=function(t_start, t_duration, t_max){
+  
+  # Get the treatment arms and icu status
+  df_arm_cov=get_arm_outcome_2(t_start=t_start, t_duration=t_duration, t_max=t_max, route="all")
+  
+  # Add the route of administration
+  enc_iv=get_arm_outcome_2(t_start=t_start, t_duration=t_duration, t_max=t_max, route="iv") %>% pull(encounter_pseudo_id)
+  enc_oral= get_arm_outcome_2(t_start=t_start, t_duration=t_duration, t_max=t_max, route="oral") %>% pull(encounter_pseudo_id)
+  df_arm_cov = df_arm_cov %>% mutate(route=case_when(encounter_pseudo_id %in% enc_iv ~ "iv", encounter_pseudo_id %in% enc_oral ~ "oral", .default="both")) 
+  
+  # Mean input missing values
+  df_arm_cov=df_arm_cov %>% filter(!is.na(encounter_discharge_date))
+  
+  # Add the outcome event and time until event
+  df_arm_cov=df_arm_cov %>% mutate(event=ifelse(!is.na(death_dttm), "death", "discharge"), time=ifelse(event=="death", difftime(death_dttm, dttm_start, unit="days"), difftime(encounter_discharge_date, dttm_start, unit="days"))) %>%
+    mutate(time=as.numeric(time, unit="days"), event=factor(event, levels=c("censored", "discharge",  "death"), labels=c("censored", "discharge", "death"))) %>% filter(time>0) %>% 
+    mutate(event_gen=ifelse(!is.na(entry_ips_dttm), "icu", ifelse(!is.na(death_dttm), "death", "discharge")), time_gen=ifelse(event_gen=="icu", difftime(entry_ips_dttm, dttm_start, unit="days"), ifelse(event_gen=="death", difftime(death_dttm, dttm_start, unit="days"), time))) %>%
+  mutate(time_gen=as.numeric(time_gen, unit="days"), event_gen=factor(event_gen, levels=c("censored", "discharge", "icu", "death"), labels=c("censored", "discharge", "icu", "death"))) %>% 
+    mutate(start=0)
+  
+  # Prepare the data frame
+  df_model=df_arm_cov %>% mutate(arm=as.factor(arm), year=as.factor(year(dttm_start))) %>% 
+    mutate(other = if_any(any_of(remove), ~ .x %in% TRUE)) %>% select(-remove[remove %in% colnames(df_arm_cov)])  %>% 
+    replace_na(list(other=F))
+  
+  # Rename the columns
+  colnames(df_model)=gsub(" ", "_", colnames(df_model)) %>% gsub("\\.", "", .)
+  df_model <- df_model[ ,names(df_model) %in% c(imm_var, materials, patient_encounter, species, "los", "dttm_start", "entry_ips_dttm", "in_hospital_mortality", "death_dttm", "encounter_pseudo_id", "time", "event", "event_gen", "time_gen", "route", "arm", "year", "inad_before", "sofa", "other_treat")]
+  
+   # Add polymicrobial infections
+  enc_mult=df_test_other %>% left_join(df_model %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
+    filter(dttm<dttm_start, dttm>dttm_start - (days(3)+t_start)) %>% pull(encounter_pseudo_id) %>% unique()
+
+    # Add polymicrobial BSI infections
+  enc_bsi=df_test_other %>% filter(category=="blood") %>%
+    left_join(df_model %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
+    filter(dttm<dttm_start, dttm>dttm_start - (days(3)+t_start)) %>% pull(encounter_pseudo_id) %>% unique()
+  df_model=df_model %>% mutate(poly_bsi=encounter_pseudo_id %in% enc_bsi, polym=encounter_pseudo_id %in% enc_mult)
+}
+
+# Prepare the dataframes for the empirical and definitive treatment
+df_model_emp=prep_df(t_start=hours(0), t_duration=hours(1), t_max=hours(48))
+df_model_def=prep_df(t_start=hours(72), t_duration=hours(48), t_max=days(5))
+
+df_model_comb=prep_df(t_start = hours(0), t_duration=hours(72), t_max=hours(48))
+
+```
+
+
+## Taget trial emmulation
+
+Emulate the target trials, includes the IPW, fitting the adjusted Aalen-Johansen and Fine-Gray models and computing the SMD.
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Function for getting the plots of interests
+#--------------------------------------------------
+
+get_plots_gen=function(data, r, icu, before=F, carbfep=F){
+  
+  # Set-up the formula for adjustment of confounding
+  formula_weightit=as.formula(paste0("arm~ polym+ poly_bsi+ other_treat +", paste(patient_encounter[patient_encounter!="ips"], collapse="+"), "+", paste(if(icu){materials[!(materials %in% remove_icu)]}else{materials}, collapse="+"), "+", paste(species, collapse="+") , "+",  paste(if(icu){c(imm_var, "sofa")}else{imm_var_gen}, collapse="+"), if(before){"+inad_before"}else{""} ))
+  
+  # Subsetting the dataframe and mean-inputation
+  df_model_temp=data %>% filter(route==r & (icu==ips)) %>% mutate(across(bmi:charlson | leukozyten:pct, ~ifelse(is.na(.x), median(.x, na.rm=T), .x))) 
+  
+  # Remove some of the rare materials for the ICU encounters
+  if(icu){
+    df_model_temp=df_model_temp %>% 
+      mutate(other = if_any(any_of(c(remove_icu, "other")), ~ .x %in% TRUE)) %>% select(-remove_icu[remove_icu %in% colnames(df_model_temp)])  %>%
+      mutate(sofa=if_else(is.na(sofa), 0, sofa)) %>%
+      replace_na(list(other=F))
+  }else{
+    df_model_temp=df_model_temp %>% select(-c(time, event)) %>% rename(time=time_gen, event=event_gen)
+  }
+  
+  # Compute the weights
+  #--------------------------------------------------
+  set.seed(12345)
+  ipwt_temp=weightit(formula_weightit, method="gbm", stabilized=T, trim.at=30, criterion="smd.max",  use.offset=T, data=df_model_temp)
+  
+  # Plot the SMD
+  #--------------------------------------------------
+  smd=plot_smd(ipwt_temp, title=paste0(ifelse(icu, "ICU ", "General wards "), ifelse(r=="iv", "intravenous", "oral")))
+  plot_smd_temp=smd$plot
+  
+  ## Aalen-Johansen curves
+  #--------------------------------------------------
+  # Fit the curve
+  aj=survfit(Surv(start, time, event)~ arm, data=df_model_temp %>% mutate(start=0), weights = ipwt_temp$weights)
+  
+  # Construct the data frame
+  df_aj <- tidy(aj)
+  
+  # Make the ggplot
+  aj_temp=plot_surv(df_aj, xmax=40, legend_sum=F, title=paste0(ifelse(icu, "ICU ", "General wards "), ifelse(r=="iv", "intravenous", "oral")), carbfep = carbfep)
+  
+  # Fit a Fine-Gray Model
+  #--------------------------------------------------
+  fg_results_temp=get_finegray(data=df_model_temp, weights=ipwt_temp$weights, etypes=if(icu| carbfep){ c("discharge", "death")}else{c("discharge", "death", "icu")}, imm_var_rest = !icu, arm=ifelse(carbfep, c("meropenem"), ifelse(r=="iv", c("2"), c("3"))))
+  
+  fg_temp=fg_results_temp %>% rename(coef_l=lower.95, coef_u=upper.95) %>% 
+    mutate(group=paste(event, "(", if_else(adj, 'adjusted', 'unadjusted'), ")")) %>% plot_glm_grp(title="Fine-Gray", xlab=paste0("HR: ", if(r=="iv"){"carbapenem-cefepime"}else{"DNA inhibitors"}, "/inadequate"))
+  
+  if(!icu){
+    fg_temp=fg_temp + theme(legend.position="none")
+  }
+  
+  # return the plots
+  return(list(smd=plot_smd_temp, fg=fg_temp, aj=aj_temp, fg_res=fg_results_temp, smd_res=smd$df, weights=ipwt_temp$weights))
+  
+}
+
+# Emulate the target trials
+plots_emp_iv=get_plots_gen(data=df_model_emp, r="iv", icu=F)
+plots_emp_oral=get_plots_gen(data=df_model_emp, r="oral", icu=F)
+plots_emp_icu=get_plots_gen(data=df_model_emp, r="iv", icu=T)
+
+plots_def_iv=get_plots_gen(data=df_model_def, r="iv", icu=F, before=T)
+plots_def_oral=get_plots_gen(data=df_model_def, r="oral", icu=F, before=T)
+plots_def_icu=get_plots_gen(data=df_model_def, r="iv", icu=T, before=T)
+
+# Scale x-axis of definitve oral therapy
+plots_def_oral$fg=plots_def_oral$fg + scale_y_continuous(trans='log10')
+
+plots_comb_iv=get_plots_gen(data=df_model_comb, r="iv", icu=F)
+plots_comb_oral=get_plots_gen(data=df_model_comb, r="oral", icu=F)
+plots_comb_icu=get_plots_gen(data=df_model_comb, r="iv", icu=T)
+
+```
+
+## Plotting
+
+Plotting of the results obtained by the target trial emulation and saving them.
+
+```{r}
+#| echo: false
+
+# Set to True for rerunning it with the matched results
+matched=F
+
+for(type in c("emp", "def", "comb")){
+  plots_list = list()
+  plots_sup = list()
+  for(sub in c("icu", "iv", "oral")){
+    
+    name_plt=if(matched){"match_"}else{"plots_"}
+    p <- get(paste0(name_plt, type, "_", sub))
+    # Combine the lower parts
+    sup  = p$smd + theme(legend.position = if(sub=="icu"){"right"}else{"none"})
+    
+    main <- (free(p$aj+ theme(legend.position = if(sub=="icu"){"right"}else{"none"}), type="panel", side="rl")) /
+      p$fg +plot_layout(heights = c(5, 2))
+    
+    plots_list[[sub]] <- main
+    plots_sup[[sub]] <- sup
+  }
+  # Combine the three plots
+  assign(paste0("plot_", type), wrap_plots( plots_list[["oral"]], plots_list[["iv"]], plots_list[["icu"]],ncol = 3) + plot_layout(guides="auto"))
+   assign(paste0("sup_", type), wrap_plots( plots_sup[["oral"]], plots_sup[["iv"]], plots_sup[["icu"]],ncol = 3) + plot_layout(guides="auto"))
+
+  # Save the plot
+   ggsave(filename=paste0(if(matched){"matched_"}else{}, type, "_main", ".pdf"), plot=get(paste0("plot_", type)), path=paste0(path, "/plots/ampc/cid/", if(matched){"supplementary/"}else{"main_figures/"}) , device="pdf", width=width*5/4, height=height*5/4, units="cm")
+  
+     ggsave(filename=paste0(if(matched){"matched_"}else{}, type, "_sup", ".pdf"), plot=get(paste0("sup_", type)), path=paste0(path, "/plots/ampc/cid/supplementary/") , device="pdf", width=width*3/2, height=height, units="cm")
+}
+
+```
+
+!!!Remove later!!!
+Investigating the imbalance of the SOFA score
+
+```{r}
+#| echo: false
+
+df_temp=df_model_def %>% filter(ips & route=="iv") %>%
+  select(sofa, age, arm, charlson, leukozyten)
+
+
+ggplot(df_temp, aes(x=leukozyten, y=sofa)) +
+  geom_point() +
+  geom_density_2d() +
+  geom_density_2d_filled(alpha=0.5)+
+  facet_wrap(vars(arm))
+
+```
+
+
+
+
+Print the table with the summary statistics and numerical results to Word documents.
+
+```{r}
+#| echo: false
+
+# We compute the summary statistics for the study populations and convert all the tables to LaTex.
+
+library(gtsummary)
+
+for(type in c("emp", "def")){
+  df = get(paste0("df_model_", type))
+  
+  for(sub in c("icu", "iv", "oral")){
+    # Prepare the data
+    name_plt=if(matched){"match_"}else{"plots_"}
+    p <- get(paste0(name_plt, type, "_", sub))
+    df_temp = df %>% filter(route==ifelse(sub=="oral", "oral", "iv") & ips==(sub=="icu")) %>% droplevels()
+    
+    # Table of the hazard ratios from the Fine-Gray models
+    #--------------------------------------------------
+    df_fg = p$fg_res %>% mutate(across(all_of(c("coef", "lower.95", "upper.95", "pvalue")), ~round(.x, 3)))
+    df_fg$HR = paste0(df_fg$coef, " (", df_fg$lower.95, "-", df_fg$upper.95, ")") 
+    
+    # Select for the final table
+    df_fg = df_fg[, c("event", "adj", "HR", "pvalue")] 
+    
+    # Convert to gt tables
+    tab_fg = df_fg %>% gt::gt() %>%
+        gt::tab_footnote( paste0("HR (hazard ratios) with 95%-confidence intervla of ", ifelse(sub!="oral", " intravenous ", " oral "), ifelse(type=="emp", "empirical", "definitive"), " treatment on ", ifelse(sub=="icu", "ICU", "general wards") ))
+    
+    # Table of population characteristic
+    #--------------------------------------------------
+    vars=c(materials, species, patient_encounter[patient_encounter!="ips"], imm_var, "ampc")
+    if(sub=="icu"){
+      vars=c(vars, "time", "event")
+    }else{
+      vars=c(vars, "time_gen", "event_gen")
+    }
+    
+    # Compute the summary statistics
+    tab_pop = df_temp %>% mutate(arm=as.factor(arm)) %>% tbl_summary(include = vars[vars %in% colnames(df_temp)], by=arm, missing="ifany", missing_stat="{N_miss}") %>% 
+      add_overall() %>% add_p() %>%  modify_spanning_header(c("stat_1", "stat_2")~"**Treatment Arm**") %>% 
+      as_gt()  %>%   gt::tab_options(table.font.size = "small") %>%
+      gt::tab_footnote(paste0("Summary statistics of the study population of ", ifelse(sub!="oral", " intravenous ", " oral "), ifelse(type=="emp", "empirical", "definitive"), " treatment on ", ifelse(sub=="icu", "ICU.", "general wards.")))  
+    
+    # Table of SMD before and after adjustment
+    #--------------------------------------------------
+    df_smd=p$smd_res %>% pivot_wider(names_from=group, values_from = SMD) 
+    tab_smd = df_smd %>% gt::gt() %>% 
+       gt::tab_footnote(paste0("SMD (standardized mean difference) between the treatment arms for the study population of ", ifelse(sub!="oral", " intravenous ", " oral "), ifelse(type=="emp", "empirical", "definitive"), " treatment on ", ifelse(sub=="icu", "ICU.", "general wards.")))
+                        
+    # Save the tables in tex-files
+    gt::gtsave(tab_pop, file=paste0(path, "/plots/ampc/cid/tables/", if(matched){"matched_"}else{}, "summary_", type, "_", sub, ".docx"))
+    gt::gtsave(tab_fg, file=paste0(path, "/plots/ampc/cid/tables/", if(matched){"matched_"}else{}, "fg_", type, "_", sub, ".docx"))
+    gt::gtsave(tab_smd, file=paste0(path, "/plots/ampc/cid/tables/", if(matched){"matched_"}else{}, "smd_", type, "_", sub, ".docx"))
+  }
+}  
+
+```
+
+
+## Matching
+
+```{r}
+#| echo: false
+
+get_plots_match=function(data, r, icu, before=F, carbfep=F){
+  
+  # Set-up the formula for adjustment of confounding
+  formula_weightit=as.formula(paste0("arm~ polym+ poly_bsi+ other_treat +", paste(patient_encounter[patient_encounter!="ips"], collapse="+"), "+", paste(if(icu|r=="oral"){materials[!(materials %in% remove_icu)]}else{materials}, collapse="+"), "+", paste(species, collapse="+") , "+",  paste(if(icu){c(imm_var, "sofa")}else{imm_var_gen}, collapse="+"), if(before){"+inad_before"}else{""} ))
+  
+  # Subsetting the dataframe
+  df_model_temp=data %>% filter(route==r & (icu==ips)) %>% mutate(across(bmi:charlson | leukozyten:pct, ~ifelse(is.na(.x), median(.x, na.rm=T), .x))) 
+  
+  # Remove some of the rare materials for the ICU encounters and zero-input missing SOFA-scores
+  if(icu){
+    df_model_temp=df_model_temp %>% 
+      mutate(other = if_any(any_of(c(remove_icu, "other")), ~ .x %in% TRUE)) %>% select(-remove_icu[remove_icu %in% colnames(df_model_temp)])  %>%
+      mutate(sofa=if_else(is.na(sofa), 0, sofa)) %>%
+      replace_na(list(other=F))
+  }else{
+    df_model_temp=df_model_temp %>% select(-c(time, event)) %>% rename(time=time_gen, event=event_gen)
+  }
+  
+  # Matching based on nearest neighborhood
+  match=matchit(formula_weightit, data=df_model_temp, caliper=0.095, std.caliper = T, method="nearest")
+
+  # Plot the SMD
+  #--------------------------------------------------
+  df_matched_total=match_data(match)
+  df_plot=bal.tab(formula_weightit, df_matched_total)$Balance %>% 
+  select(Type, Diff.Un) %>% rename(adjusted=Diff.Un)
+
+  # Total difference between all arms
+  df_plot=bal.tab(formula_weightit, df_model_temp)$Balance %>% 
+  select(Type, Diff.Un) %>% rename(unadjusted=Diff.Un) %>%
+  mutate(adjusted=df_plot$adjusted)
+  smd=plot_smd(df_plot, title=paste0(ifelse(icu, "ICU ", "General wards "), ifelse(r=="iv", "intravenous", "oral")), match=T)
+  plot_smd_temp=smd$plot
+  
+  ## Aalen-Johansen curves
+  #--------------------------------------------------
+  # Fit the curve
+  aj=survfit(Surv(start, time, event)~ arm, data=df_matched_total %>% mutate(start=0))
+  
+  # Construct the data frame
+  df_aj <- tidy(aj)
+  
+  # Make the ggplot
+  aj_temp=plot_surv(df_aj, xmax=40, legend_sum=F, title=paste0(ifelse(icu, "ICU ", "General wards "), ifelse(r=="iv", "IV", "oral")), carbfep = carbfep)
+  
+  # Fit a Fine-Gray Model
+  #--------------------------------------------------
+  weights_m=as.numeric(df_model_temp$encounter_pseudo_id %in% (df_matched_total %>% pull(encounter_pseudo_id)))
+  fg_results_temp=get_finegray(data=df_model_temp, weights=weights_m, etypes=if(icu|r=="oral"){ c("discharge", "death")}else{c("discharge", "death", "icu")}, imm_var_rest = !icu, arm=ifelse(carbfep, "meropenem", ifelse(r=="iv", c("2"), c("3"))))
+  
+  fg_temp=fg_results_temp %>% rename(coef_l=lower.95, coef_u=upper.95) %>% 
+    mutate(group=paste(event, "(", if_else(adj, 'adjusted', 'unadjusted'), ")")) %>% plot_glm_grp(title="Fine-Gray", xlab=paste0("HR: ", if(r=="iv"){"carbapenem-cefepime"}else{"DNA inhibitors"}, "/inadequate"))
+  
+  if(!icu){
+    fg_temp=fg_temp + theme(legend.position="none")
+  }
+  
+  # return the plots
+  return(list(smd=plot_smd_temp, fg=fg_temp, aj=aj_temp, fg_res=fg_results_temp, smd_res=smd$df, weights=weights_m))
+
+}
+
+
+# Emulate the target trials
+match_emp_iv=get_plots_match(data=df_model_emp, r="iv", icu=F)
+match_emp_oral=get_plots_match(data=df_model_emp, r="oral", icu=F)
+match_emp_icu=get_plots_gen(data=df_model_emp, r="iv", icu=T)
+
+match_def_iv=get_plots_match(data=df_model_def, r="iv", icu=F, before=T)
+match_def_oral=get_plots_match(data=df_model_def, r="oral", icu=F, before=F)
+match_def_icu=get_plots_match(data=df_model_def, r="iv", icu=T, before=T)
+
+match_comb_iv=get_plots_match(data=df_model_comb, r="iv", icu=F)
+match_comb_oral=get_plots_match(data=df_model_comb, r="oral", icu=F)
+match_comb_icu=get_plots_match(data=df_model_comb, r="iv", icu=T)
+
+
+```
+Run the plotting section again with matched=T to save the results.
+
+
+# Resistance and Relapse
+
+In this section, we provide the analysis of the microbiological relapses and the resistance.
+
+## Microbiological relapse
+
+We start by considering the intention to treat arm first. We define a microbiological relapse as a second positive test after more than 7 days from the initial positive test.
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Construct dataframe for relapses
+#--------------------------------------------------
+
+# Make a dataframe with all the later test
+df_test_after=df_test %>% left_join(df_empirical %>% select(encounter_pseudo_id, dttm_test) %>% rename(dttm_min=dttm_test) %>% mutate(first=T), by=c("encounter_pseudo_id", "dttm_min")) %>% 
+  filter(is.na(first)) %>% select(-first)
+
+# Take only the test that are after the first one
+df_empirical_relapse =df_empirical_all %>% rename(dttm_test=dttm) %>%
+  left_join(df_empirical %>% select(encounter_pseudo_id, dttm_test) %>% rename(dttm_1=dttm_test), by="encounter_pseudo_id") %>%
+  filter(dttm_test >= dttm_1 + days(7)) %>% select(-dttm_1)
+
+# Filter for the second test
+df_empirical_relapse=df_empirical_relapse %>% summarise(dttm_test=min(dttm_test), .by="encounter_pseudo_id") %>% mutate(first=T) %>%
+  left_join(df_empirical_relapse, by=c("encounter_pseudo_id", "dttm_test")) %>% filter(!is.na(first)) %>%
+  replace(is.na(.), F) %>% select(-first) %>% mutate(date=as.Date(dttm_test))
+
+# Rename the columns and substitute missing test with F
+df_empirical_relapse=df_empirical_relapse %>% rename_with(.fn=~paste0(.x, "_2"), .cols=2:(dim(df_empirical_relapse)[2])) %>%
+  replace(is.na(.), F)
+
+# Merge the dataframes
+df_relapse=get_arm_outcome_2(t_start=hours(0), t_duration=hours(72), t_max=hours(48), route="all") %>% 
+  left_join(df_empirical_relapse, by="encounter_pseudo_id") %>%
+  mutate(t_diff=difftime(dttm_test_2, dttm_test, unit="days"), relapse=!is.na(t_diff)) %>% mutate(arm=as.factor(arm))
+
+```
+
+
+Help-function for emulation of the target trial using weighted poisson regression.
+
+```{r}
+#| echo: false
+
+get_plots_glm=function(data, outcome, title="", xlab="OR: inadequate/adequate", incl.t=F, method="gbm", name_glm_coef="arminadequate", cont=F){
+  
+  # Set-up the formula for adjustment of confounding
+  formula_weightit=as.formula(paste0("arm~ polym+ poly_bsi+", paste(patient_encounter, collapse="+"), "+", paste(materials[!(materials %in% c("female_reproductive_organs", "pus", "abdomen"))], collapse="+"), "+", paste(species, collapse="+") , "+",  paste(imm_var_gen, collapse="+"), if(incl.t){"+  t_risk"}else if(cont){"+poly(t_risk, 2)"}else{"+ other_treat"}))
+  
+  # Sub-setting the dataframe
+  df_model_temp=data %>% mutate(across(bmi:charlson | leukozyten:pct, ~ifelse(is.na(.x), median(.x, na.rm=T), .x))) 
+  
+  # Compute the weights
+  #--------------------------------------------------
+  set.seed(12345)
+  ipwt_temp=weightit(formula_weightit, method=method, stabilized=T, criterion=if(cont){"p.max"}else{"smd.max"}, data=df_model_temp)
+  
+  # Plot the SMD
+  #--------------------------------------------------
+  smd=plot_smd(ipwt_temp, title="Sample balance", cont=cont)
+  plot_smd_temp=smd$plot
+  
+  # Fit the generalized linear models
+  #--------------------------------------------------
+  formula_glm=as.formula(paste0(outcome, "~ arm + ", paste(materials[!(materials %in% c("female_reproductive_organs", "pus", "abdomen"))], collapse="+"), "+", paste(species, collapse="+") , "+", paste(patient_encounter, collapse="+"), "+", paste(imm_var_gen, collapse="+"), if(incl.t){"+  poly(t_risk, 2)"}else if(cont){"+poly(t_risk, 2)"}else{"+ other_treat"}))
+
+  # Using the WeightIt package for IPW
+  fit=glm_weightit(formula_glm, family=quasibinomial(link="logit"), data=df_model_temp, weightit=ipwt_temp)
+  summary(fit)
+
+  # Unadjusted for comparison
+  fit_unadj=glm(as.formula(paste0(outcome, "~arm")), data=df_model_temp, family = quasibinomial(link="logit"))
+
+  # Compute the confidence intervals for the odds ratio
+  conf=exp(confint(fit, level=0.95))
+  conf_unadj=exp(confint(fit_unadj, level=0.95))
+  
+  # Construct the dataframe
+  df_plot=data.frame(coef=c(exp(fit$coefficients[name_glm_coef]), exp(fit_unadj$coefficients[name_glm_coef])),
+                     coef_l=c(conf[name_glm_coef, 1], conf_unadj[name_glm_coef, 1]),
+                      coef_u=c(conf[name_glm_coef, 2], coef_u=conf_unadj[name_glm_coef, 2]),
+                     group=c("adjusted", "unadjusted"),
+                     pvalue=c(coef(summary(fit))[-1, 4][name_glm_coef], coef(summary(fit_unadj))[name_glm_coef, 4]))
+
+  
+  # Plot the coefficients of the glm
+  glm=plot_glm_grp(df_plot %>% mutate(adj=ifelse(group=="adjusted", T, F)) %>% arrange(desc(group)), title= title, xlab=xlab)
+    
+  # return the plots
+  return(list(smd=plot_smd_temp, glm=glm, glm_res=df_plot, smd_res=smd$df, weights=ipwt_temp$weights))
+  
+}
+
+```
+
+
+Next, we do a IPWT and use a logistic linear regression the estimate the effects.
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# inverse probability weighting
+#--------------------------------------------------
+
+# Prepare the dataframe
+df_model_rel=df_model_emp %>% left_join(df_relapse %>% select(relapse, encounter_pseudo_id, t_diff), by="encounter_pseudo_id") %>%
+  mutate(arm=if_else(arm=="1", "inadequate", "adequate")) %>% mutate(relapse_30=if_else(!is.na(t_diff), relapse & t_diff<=days(30), F)) %>%
+  mutate(mort_30=if_else(!is.na(death_dttm), in_hospital_mortality & (difftime(death_dttm, dttm_start)<=days(30)), F)) %>%
+  mutate(clinical_30=mort_30 | relapse_30) %>% replace_na(list(relapse=F))
+
+# Taget trial emulation
+plots_rel=get_plots_glm(df_model_rel, outcome="relapse", title= "Microbiological relapse")
+
+```
+
+
+## New AmpC-like phenotype
+
+Next, we investigate the occurrence of new AmpC-like resistances.
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Construct the data frame for resistance
+#--------------------------------------------------
+
+vars=c(materials, species, patient_encounter, imm_var)
+
+# Add the resistance data to the data frame, aggregate the resistance test in case of several infection sites
+df_empirical_res=df_test %>% select(encounter_pseudo_id, dttm_min, etp10:ir) %>% unique() %>% 
+  summarise(across(etp10:ir, ~ifelse("R" %in% .x, "R", ifelse(all(is.na(.x)), NA, "s"))), .by=c("encounter_pseudo_id", "dttm_min")) %>%
+  rename(dttm=dttm_min)
+
+df_empirical_res=df_empirical_all %>% left_join(df_empirical_res , by=c("encounter_pseudo_id", "dttm")) %>%
+  mutate(across(etp10:ir, ~as.factor(.x))) %>%  
+  filter(!is.na(tpz) & !is.na(cro))  %>% 
+  mutate(ampc_n=as.numeric((tpz=="R")+(cro=="R"))) %>% mutate(ampc=ampc_n>1) 
+
+# Mark the first test
+df_empirical_res=df_empirical_res %>% summarise(dttm_1=min(dttm), .by="encounter_pseudo_id") %>% mutate(first=T) %>%
+  right_join(df_empirical_res, by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm_1==dttm)) %>% rename(dttm=dttm_1)
+
+# Dataframe with the first test for each encounter
+df_test_1=df_empirical_res %>% filter(!is.na(first)) %>% select(-first) 
+
+# Dataframe with the second test 
+df_test_2=df_empirical_res %>% filter(is.na(first)) %>% select(-first) %>%
+  summarise(dttm_2=min(dttm), .by="encounter_pseudo_id") %>% mutate(second=T) %>%
+  right_join(df_empirical_res, by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm_2==dttm)) %>% rename(dttm=dttm_2) %>%
+  filter(!is.na(second)) %>% select(-c(second, first)) 
+  
+# Combine the data frames
+df_resistance=df_test_2 %>% rename_with(.cols=2:ncol(df_test_2), .fn=function(x) paste0(x, "_2")) %>%
+  right_join(df_test_1 %>% rename_with(.cols=2:ncol(df_test_1), .fn=function(x) paste0(x, "_1")), by="encounter_pseudo_id") %>%
+  left_join(df_con, by="encounter_pseudo_id") %>% filter(age>=18)
+
+# Movements between ICU and normal stations
+df_icu=df_departement %>% filter(encounter_pseudo_id %in% df_resistance$encounter_pseudo_id) %>%
+  group_by(encounter_pseudo_id) %>% arrange(entry_dttm) %>% mutate(discharge_dttm=lead(entry_dttm)) %>% ungroup() %>%
+  filter(departement_abbreviation!="DISCHARGE")
+
+#Add the ICU status to the dataframe
+by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm_2>=entry_dttm, dttm_1<discharge_dttm)
+df_resistance=df_resistance %>% right_join(df_icu, by) %>% left_join(df_empirical, by=c("encounter_pseudo_id")) %>% replace_na(list(ips=F)) %>%
+  summarise(ips=any(ips), .by="encounter_pseudo_id") %>% 
+  right_join(df_resistance, by="encounter_pseudo_id") %>% mutate(t_risk=difftime(dttm_2, dttm_1, unit="days"))
+
+# Keep only the covariates needed for now
+df_model_res=df_resistance %>% 
+  filter(ampc_n_1==0 & !is.na(ampc_n_2) & t_risk>=0.25) %>% mutate(ampc=ampc_2, month=as.factor(month(dttm_1))) %>% 
+  rename(dttm_start=dttm_1, dttm_end=dttm_2) %>% 
+  select(-ends_with("_2"), -ampc_1) %>% rename_if(.predicate=endsWith(names(.), "_1"), .funs=function(x) gsub( "`", "", x) %>% substr( 1, nchar(.)-2)) %>%
+  mutate(other = if_any(any_of(remove), ~ .x %in% TRUE)) %>% select(-remove[remove %in% colnames(df_resistance)])
+
+# Add the inducers: If only inducer vs. no inducers
+t_before=days(3)
+
+enc_ind_3d=df_treat %>% left_join(df_model_res %>% select(dttm_start, dttm_end, encounter_pseudo_id), by="encounter_pseudo_id") %>%
+  filter(!is.na(dttm_start)) %>% filter(dttm<=dttm_end & dttm>=dttm_end-t_before) %>%
+  filter(arm=="1") %>% pull(encounter_pseudo_id) %>% unique()
+
+df_model_res=df_model_res %>% mutate(ind=(encounter_pseudo_id %in% enc_ind_3d))
+
+
+# Add the immunology data
+df_imm_48=df_imm %>% left_join(df_model_res %>% select(encounter_pseudo_id, dttm_end), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_end, dttm>dttm_end - hours(72))
+  
+# Keep the last test, convert to wide format
+df_imm_add=df_imm_48 %>% summarise(dttm_last=max(dttm), .by=c("encounter_pseudo_id", "imm_code")) %>%
+  rename(dttm=dttm_last) %>%
+  right_join(df_imm_48, by=c("encounter_pseudo_id", "imm_code", "dttm")) %>% 
+  select(encounter_pseudo_id, imm_code, obs_val) %>% 
+  pivot_wider(values_from = obs_val, names_from = imm_code, values_fn=mean) 
+
+# Add the immunology data
+df_model_res=df_model_res %>% left_join(df_imm_add, by="encounter_pseudo_id") 
+
+# Rename the columns and convert the types for gradient boosting
+colnames(df_model_res)=gsub(" ", "_", colnames(df_model_res)) %>% gsub("\\.", "", .)
+df_model_res=df_model_res %>% rename(arm=ind) %>% mutate(arm=if_else(arm, "inadequate", "adequate"))
+
+
+# Add polymicrobial infections
+enc_mult=df_test_other %>% left_join(df_model_res %>% select(encounter_pseudo_id, dttm_start, dttm_end), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_end, dttm>dttm_start - days(3)) %>% pull(encounter_pseudo_id) %>% unique()
+
+# Add polymicrobial BSI infections
+enc_bsi=df_test_other %>% filter(category=="blood") %>%
+  left_join(df_model_res %>% select(encounter_pseudo_id, dttm_start, dttm_end), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_end, dttm>dttm_start - (days(3))) %>% pull(encounter_pseudo_id) %>% unique()
+df_model_res=df_model_res %>% mutate(poly_bsi=encounter_pseudo_id %in% enc_bsi, polym=encounter_pseudo_id %in% enc_mult)
+
+# Mean-input missing values
+df_model_res = df_model_res[ ,names(df_model_res) %in% c(vars, "dttm_start", "dttm_end", "los", "dttm_start", "death_dttm", "encounter_pseudo_id", "ampc", "t_risk", "arm", "poly_bsi", "polym", "ips") ] %>% replace_na(list(ampc=F))  %>% mutate(t_risk=as.numeric(t_risk, unit="days")) %>%
+  mutate(across(all_of(c(materials, species)), ~if_else(is.na(.x), F, .x)))
+```
+
+Emulate the target trial for new AmpC-like phenotype.
+
+```{r}
+#| echo: false
+
+# Emulate the target trial
+plots_res=get_plots_glm(data=df_model_res, outcome="ampc", title="New AmpC-like phenotype", incl.t=T)
+
+```
+
+
+## Revision of AmpC-like phenotype
+
+We first construct a dataframe and bring it in a suitable format.
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Construct the data frame
+#--------------------------------------------------
+
+# Remove the marks from the new resistance
+df_empirical_res=df_empirical_res %>% select(-first)  %>%
+  mutate(other = if_any(any_of(remove), ~ .x %in% TRUE)) %>% select(-remove[remove %in% colnames(df_empirical_res)])
+
+# Mark the first resistant test
+df_empirical_res=df_empirical_res %>% filter(ampc) %>% summarise(dttm_r1=min(dttm), .by="encounter_pseudo_id") %>%
+  right_join(df_empirical_res, by=join_by(encounter_pseudo_id==encounter_pseudo_id))
+
+# Mark the first non resistant test after
+df_empirical_res=df_empirical_res %>% filter(!is.na(dttm_r1)) %>% filter(!ampc & dttm>dttm_r1) %>% 
+  summarise(dttm_s=min(dttm), .by="encounter_pseudo_id") %>%
+  right_join(df_empirical_res, by=join_by(encounter_pseudo_id==encounter_pseudo_id))
+
+# Mark the last resistance before the susceptible
+df_empirical_res=df_empirical_res %>% filter(!is.na(dttm_r1)) %>% filter(ampc & dttm+hours(1)<dttm_s) %>% 
+  summarise(dttm_r2=max(dttm), .by="encounter_pseudo_id") %>%
+  right_join(df_empirical_res, by=join_by(encounter_pseudo_id==encounter_pseudo_id))
+
+
+#--------------------------------------------------
+# Set up the timeline
+#--------------------------------------------------
+
+# Select the encounter with revision
+df_model_rev=df_empirical_res %>% filter(!is.na(dttm_r2)) %>% filter(dttm_s==dttm) %>% 
+  select(encounter_pseudo_id, ampc_n, ampc, dttm_s) %>% rename(dttm_2=dttm_s, ampc_n2=ampc_n, ampc_2=ampc) %>%
+  left_join(df_empirical_res %>% filter(!is.na(dttm_r2)) %>% filter(dttm_r2==dttm) %>% rename(dttm_1=dttm_r2), by="encounter_pseudo_id")
+
+# Add encounters with two test but no revision
+df_neg=df_empirical_res %>% filter(!is.na(dttm_r1) & !(encounter_pseudo_id %in% df_model_rev$encounter_pseudo_id)) %>% 
+  filter(dttm>dttm_r1) %>% summarise(dttm_p=min(dttm), .by="encounter_pseudo_id") %>%
+  right_join(df_empirical_res, by="encounter_pseudo_id")
+
+# Add them to the other dataframe 
+df_model_rev=df_neg %>% filter(!is.na(dttm_p)) %>% filter(dttm_p==dttm) %>% 
+  select(encounter_pseudo_id, ampc_n, ampc, dttm_p) %>% rename(dttm_2=dttm_p, ampc_n2=ampc_n, ampc_2=ampc) %>%
+  left_join(df_neg %>% filter(!is.na(dttm_p)) %>% filter(dttm_r1==dttm) %>% mutate(dttm_1=dttm_r1), by="encounter_pseudo_id") %>%
+  add_row(df_model_rev) %>% mutate(t_risk=difftime(dttm_2, dttm_1, unit="days"))
+
+rm(df_neg)
+
+#--------------------------------------------------
+# Add the icu status and other confounders
+#--------------------------------------------------
+df_icu=df_departement %>% filter(encounter_pseudo_id %in% df_model_rev$encounter_pseudo_id) %>%
+  group_by(encounter_pseudo_id) %>% arrange(entry_dttm) %>% mutate(discharge_dttm=lead(entry_dttm)) %>% ungroup() %>%
+  filter(departement_abbreviation!="DISCHARGE")
+
+# Movements between ICU and normal stations
+by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm_2>=entry_dttm, dttm_1<discharge_dttm)
+df_model_rev=df_model_rev %>% right_join(df_icu, by=by)  %>% summarise(ips=any(ips), .by="encounter_pseudo_id") %>%
+  right_join(df_model_rev, by="encounter_pseudo_id") %>% 
+  left_join(df_con %>% select(patient_encounter[patient_encounter!="ips"], encounter_pseudo_id), by="encounter_pseudo_id") 
+
+# Add the immunology data
+#--------------------------------------------------
+df_imm_48=df_imm %>% left_join(df_model_rev %>% select(encounter_pseudo_id, dttm_1, dttm_2), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_2, dttm>dttm_1 - hours(72))
+  
+# Keep the last test, convert to wide format
+df_imm_add=df_imm_48 %>% summarise(dttm_last=max(dttm), .by=c("encounter_pseudo_id", "imm_code")) %>%
+  rename(dttm=dttm_last) %>%
+  right_join(df_imm_48, by=c("encounter_pseudo_id", "imm_code", "dttm")) %>% 
+  select(encounter_pseudo_id, imm_code, obs_val) %>% 
+  pivot_wider(values_from = obs_val, names_from = imm_code, values_fn=mean) 
+
+# Add the immunology data
+df_model_rev=df_model_rev %>% left_join(df_imm_add, by="encounter_pseudo_id") 
+
+
+# Add polymicrobial infections
+#--------------------------------------------------
+enc_mult=df_test_other %>% left_join(df_model_rev %>% select(encounter_pseudo_id, dttm_1, dttm_2), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_2, dttm>dttm_1 - days(3)) %>% pull(encounter_pseudo_id) %>% unique()
+
+# Add polymicrobial BSI infections
+enc_bsi=df_test_other %>% filter(category=="blood") %>%
+  left_join(df_model_rev %>% select(encounter_pseudo_id,  dttm_1, dttm_2), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_2, dttm>dttm_1 - (days(3))) %>% pull(encounter_pseudo_id) %>% unique()
+df_model_rev=df_model_rev %>% mutate(poly_bsi=encounter_pseudo_id %in% enc_bsi, polym=encounter_pseudo_id %in% enc_mult)
+
+# Mean-input missing values
+colnames(df_model_rev)=gsub(" ", "_", colnames(df_model_rev)) %>% gsub("\\.", "", .)
+df_model_rev <- df_model_rev[ ,names(df_model_rev) %in% c(vars, "dttm_1", "dttm_2", "los", "entry_ips_dttm", "encounter_pseudo_id", "ampc", "ampc_2", "polym", "poly_bsi", "arm", "t_risk", "ips") ]  %>% mutate(t_risk=as.numeric(t_risk, unit="days")) %>% replace_na(list(sex="M")) %>% mutate(across(c(polym, poly_bsi, ips), ~ifelse(is.na(.x), F, .x)), across(urine:klebsiella_aerogenes | age, ~ifelse(is.na(.x), F, .x)))
+
+#--------------------------------------------------
+# Add the inducers
+#--------------------------------------------------
+enc_ind_3d=df_treat %>% left_join(df_model_rev %>% select(dttm_1, dttm_2, encounter_pseudo_id), by="encounter_pseudo_id") %>% 
+  filter(dttm>=dttm_1 & dttm<=dttm_2 & dttm>=dttm_2-days(3)) %>%
+  filter(arm=="1") %>% pull(encounter_pseudo_id) %>% unique()
+
+# Check if for others, adequate another arm was administered
+enc_adq_3d=df_treat %>% left_join(df_model_rev %>% select(dttm_1, dttm_2, encounter_pseudo_id), by="encounter_pseudo_id") %>% 
+  filter(dttm>=dttm_1 & dttm<=dttm_2 & dttm>=dttm_2-days(3)) %>%
+  filter(arm!="1") %>% pull(encounter_pseudo_id) %>% unique()
+
+df_model_rev=df_model_rev %>% mutate(arm=(encounter_pseudo_id %in% enc_ind_3d)) %>% filter(arm | encounter_pseudo_id %in% enc_adq_3d) %>%
+  mutate(arm=if_else(arm, "inadequate", "adequate"))
+
+```
+
+
+Emulate the target trial for the revision of AmpC-like phenotype.
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Inverse probability weighting
+#--------------------------------------------------
+
+plots_rev=get_plots_glm(data=df_model_rev, outcome="ampc_2", title="Persistence of AmpC-like phenotype", incl.t=T, method="glm")
+
+```
+
+
+Combine the two plots and save them.
+
+```{r}
+#| echo: false
+
+# Combine the two plots using patchwork
+plot_res = free(plots_res$glm + theme(legend.position="none"), type="label") + free(plots_rev$glm + theme(legend.position="none"), type="label") + plots_res$smd +  plots_rev$smd + plot_layout(tag_level="keep", axes="keep", heights=c(1, 4), guides="collect")
+
+plot_rel=free(plots_rel$glm + theme(legend.position="none"), type="label") + plots_rel$smd + plot_layout(ncol=1, heights = c(1,4), guides="collect")
+
+# Save the plots
+ggsave(filename=paste0("resistance", ".pdf"), plot=plot_res, path=paste0(path, "/plots/ampc/cid/main_figures/", if(high_mutation){"high/"}else{""}), device="pdf", width =width*5/4, height=height*5/4, units="cm")
+
+ggsave(filename="relapse.pdf", plot=plot_rel, path=paste0(path, "/plots/ampc/cid/supplementary/", if(high_mutation){"high/"}else{""}), device="pdf", width =width*4/5, height=height*5/4, units="cm")
+
+```
+
+
+
+# Cefepime vs. Carbapenems
+
+We test the hypothesis if cefepime compared to carbapenems lead to higher MIC (take also I into account) and longer hospital stays.
+
+## Clinical outcome
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Construct the dataframe
+#--------------------------------------------------
+
+# Determine the initial treatment
+df_carb_cef=get_anti_outcome(t_start=hours(0), t_max=hours(48), t_duration=hours(72))
+
+# Mean input missing values
+df_carb_cef=df_carb_cef %>% 
+  filter(!is.na(encounter_discharge_date)) %>% filter(anti!="imipenem and enzyme inhibitor")
+
+# Add the outcome event and time until event
+df_carb_cef=df_carb_cef %>% mutate(event=ifelse(!is.na(death_dttm), "death", "discharge"), time=ifelse(event=="death", difftime(death_dttm, dttm_start, unit="days"), difftime(encounter_discharge_date, dttm_start, unit="days"))) %>%
+  mutate(time=as.numeric(time, unit="days"), event=factor(event, levels=c("censored", "discharge",  "death"), labels=c("censored", "discharge", "death"))) %>% filter(time>0) %>% select(-arm) %>% rename(arm=anti)
+
+# Prepare the data frame
+df_model_carbcef=df_carb_cef %>% mutate(arm=as.factor(arm), month=as.factor(month(dttm_start))) %>% 
+  mutate(other = if_any(any_of(remove), ~ .x %in% TRUE))%>% select(-remove[remove %in% colnames(df_carb_cef)])
+
+# Rename the columns
+colnames(df_model_carbcef)=gsub(" ", "_", colnames(df_model_carbcef)) %>% gsub("\\.", "", .)
+df_model_carbcef <- df_model_carbcef[ ,names(df_model_carbcef) %in% c(vars,imm_var, "los", "dttm_start", "entry_ips_dttm", "in_hospital_mortality", "death_dttm", "encounter_pseudo_id", "time", "event", "inad_before", "other_treat", "death_dttm", "in_hospital_mortality", "ips", "arm")] %>% mutate(time_gen=time, event_gen=event)
+
+
+# Add polymicrobial infections
+enc_mult=df_test_other %>% left_join(df_model_carbcef %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
+    filter(dttm<dttm_start, dttm>dttm_start - (days(3))) %>% pull(encounter_pseudo_id) %>% unique()
+
+# Add polymicrobial BSI infections
+enc_bsi=df_test_other %>% filter(category=="blood") %>%
+    left_join(df_model_carbcef %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
+    filter(dttm<dttm_start, dttm>dttm_start - (days(3))) %>% pull(encounter_pseudo_id) %>% unique()
+df_model_carbcef=df_model_carbcef %>% mutate(poly_bsi=encounter_pseudo_id %in% enc_bsi, polym=encounter_pseudo_id %in% enc_mult)
+
+
+#--------------------------------------------------
+# Inverse probability weighting
+#--------------------------------------------------
+
+# This leads to bad sample balance, i.e. large SMD, since the treatment arms are too small to estimate HR.
+# plots_temp=get_plots_gen(data=df_model_carbcef %>% mutate(route="iv"), r="iv", icu=F, carbfep=T)
+
+
+```
+
+
+We add a logistic regression for the 30-day clinical failure (relapse or mortality).
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Fit a weighted logistic regression
+#--------------------------------------------------
+
+# Add the 30-day clinical failure to the model
+df_model_30=df_model_carbcef %>% mutate(mort_30=if_else(!is.na(death_dttm), difftime(dttm_start, death_dttm)<=days(30), F)) %>%
+  left_join(df_empirical_relapse %>% select(encounter_pseudo_id, dttm_test_2), by="encounter_pseudo_id") %>%
+  mutate(rel_30=if_else(!is.na(dttm_test_2), difftime(dttm_test_2, dttm_start)<=days(30), F)) %>% mutate(clinical_30=rel_30 | mort_30)
+
+# Emulate the target trial
+plots_30=get_plots_glm(data=df_model_30, outcome="clinical_30", title="30-day clinical failure", xlab="OR: meropenem/cefepime", method="glm", name_glm_coef = "armmeropenem")
+
+```
+
+
+## Resistance
+
+Next, we investigate if we can see an increased MIC for cefepime. We first do the preprocessing.
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Preprocess the resistance data
+#--------------------------------------------------
+
+# Keep all three resistance levels, i.e. "S", "I", and "R"
+df_empirical_res2=df_test %>% select(encounter_pseudo_id, dttm_min, etp10:ir) %>% unique() %>% summarise(across(etp10:ir, ~ifelse("R" %in% .x, "R", ifelse("I" %in% .x, "I", ifelse(all(is.na(.x)), NA, "S")))), .by=c("encounter_pseudo_id", "dttm_min")) %>% rename(dttm=dttm_min)
+
+df_empirical_res2=df_empirical_all %>% left_join(df_empirical_res2 , by=c("encounter_pseudo_id", "dttm")) %>%
+  mutate(across(etp10:ir, ~as.factor(.x))) %>%  
+  filter(!(is.na(mem) & is.na(fep))) 
+
+# Mark the first test
+df_empirical_res2=df_empirical_res2 %>% summarise(dttm_1=min(dttm), .by="encounter_pseudo_id") %>%
+  right_join(df_empirical_res2, by=join_by(encounter_pseudo_id==encounter_pseudo_id))
+
+# Mark the second test
+df_empirical_res2=df_empirical_res2 %>% filter(dttm>dttm_1+hours(12)) %>% 
+  summarise(dttm_2=min(dttm), .by="encounter_pseudo_id") %>%
+  right_join(df_empirical_res2, by="encounter_pseudo_id")
+
+
+#--------------------------------------------------
+# Set up the timeline
+#--------------------------------------------------
+
+df_model_res_carbcef = df_empirical_res2 %>% filter(dttm==dttm_2) %>% select(encounter_pseudo_id, dttm, mem, fep) %>%
+  rename_with(.cols=2:4, .fn=function(x) paste0(x, "_2")) %>%
+  left_join(df_empirical_res2 %>% filter(dttm==dttm_1) %>% select(-c(dttm, dttm_2)), by="encounter_pseudo_id") %>%
+  left_join(df_con, by="encounter_pseudo_id") %>% filter(age>=18) %>% mutate(t_risk=difftime(dttm_2, dttm_1, unit="days"))
+
+# Movements between ICU and normal stations
+df_icu=df_departement %>% filter(encounter_pseudo_id %in% df_model_res_carbcef$encounter_pseudo_id) %>%
+  group_by(encounter_pseudo_id) %>% arrange(entry_dttm) %>% mutate(discharge_dttm=lead(entry_dttm)) %>% ungroup() %>%
+  filter(departement_abbreviation!="DISCHARGE")
+
+by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm_2>=entry_dttm, dttm_1<discharge_dttm)
+df_model_res_carbcef=df_model_res_carbcef %>% right_join(df_icu, by=by)  %>% summarise(ips=any(ips), .by="encounter_pseudo_id") %>%
+  right_join(df_model_res_carbcef, by="encounter_pseudo_id") 
+
+
+#--------------------------------------------------
+# Add the treatment information
+#--------------------------------------------------
+
+# Add the treatment information
+enc_carb=df_treat %>% left_join(df_model_res_carbcef %>% select(dttm_1, dttm_2, encounter_pseudo_id), by="encounter_pseudo_id") %>% 
+  filter(!is.na(dttm_1)) %>% filter(dttm>=dttm_1 & dttm<=dttm_2 & dttm>=dttm_2-days(3)) %>%
+  filter(anti_name %in% carbapenems) %>% pull(encounter_pseudo_id) %>% unique()
+
+enc_cef=df_treat %>% left_join(df_model_res_carbcef %>% select(dttm_1, dttm_2, encounter_pseudo_id), by="encounter_pseudo_id") %>% 
+  filter(!is.na(dttm_1)) %>% filter(dttm>=dttm_1 & dttm<=dttm_2 & dttm>=dttm_2-days(3)) %>%
+  filter(anti_name=="cefepime") %>% pull(encounter_pseudo_id) %>% unique()
+
+enc_ind=df_treat %>% left_join(df_model_res_carbcef %>% select(dttm_1, dttm_2, encounter_pseudo_id), by="encounter_pseudo_id") %>% 
+  filter(!is.na(dttm_1)) %>% filter(dttm>=dttm_1 & dttm<=dttm_2 & dttm>=dttm_2-days(3)) %>%
+  filter(arm=="1") %>% pull(encounter_pseudo_id) %>% unique()
+
+# Keep only the encounter with a unique treatment arm
+df_model_res_carbcef=df_model_res_carbcef %>% filter(xor(encounter_pseudo_id %in% enc_carb, encounter_pseudo_id %in% enc_cef)) %>%
+  mutate(arm=ifelse(encounter_pseudo_id %in% enc_cef, "cefepime", "meropenem")) %>% 
+  mutate(org_res=if_else(arm=="mereopenem", mem, fep)) %>% mutate(new_res=if_else(arm=="meropnem", mem_2, fep_2))
+
+# Add the immunology data
+df_imm_48=df_imm %>% left_join(df_model_res_carbcef %>% select(encounter_pseudo_id, dttm_2), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_2, dttm>dttm_2 - hours(48))
+  
+# Keep the last test, convert to wide format
+df_imm_add=df_imm_48 %>% summarise(dttm_last=max(dttm), .by=c("encounter_pseudo_id", "imm_code")) %>%
+  rename(dttm=dttm_last) %>%
+  right_join(df_imm_48, by=c("encounter_pseudo_id", "imm_code", "dttm")) %>% 
+  select(encounter_pseudo_id, imm_code, obs_val) %>% 
+  pivot_wider(values_from = obs_val, names_from = imm_code, values_fn=mean) 
+
+# Add the immunology data
+df_model_res_carbcef=df_model_res_carbcef %>% left_join(df_imm_add, by="encounter_pseudo_id") 
+
+
+# Add polymicrobial infections
+enc_mult=df_test_other %>% left_join(df_model_res_carbcef%>% select(encounter_pseudo_id, dttm_1, dttm_2), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_2, dttm>dttm_1 - days(3)) %>% pull(encounter_pseudo_id) %>% unique()
+
+# Add polymicrobial BSI infections
+enc_bsi=df_test_other %>% filter(category=="blood") %>%
+  left_join(df_model_res_carbcef %>% select(encounter_pseudo_id, dttm_1, dttm_2), by="encounter_pseudo_id") %>%
+  filter(dttm<dttm_2, dttm>dttm_1 - (days(3))) %>% pull(encounter_pseudo_id) %>% unique()
+df_model_res_carbcef=df_model_res_carbcef %>% mutate(poly_bsi=encounter_pseudo_id %in% enc_bsi, polym=encounter_pseudo_id %in% enc_mult)
+
+# Remove some of the matrials and summarise them in "other"
+ df_model_res_carbcef= df_model_res_carbcef %>%
+  mutate(other = if_any(any_of(remove), ~ .x %in% TRUE)) %>% select(-remove[remove %in% colnames(df_model_res_carbcef)])
+
+```
+
+
+Inverse probability weighting and regression.
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Preprocess the resistance data
+#--------------------------------------------------
+
+# Prepare the data frame
+colnames(df_model_res_carbcef)=gsub(" ", "_", colnames(df_model_res_carbcef)) %>% gsub("\\.", "", .)
+df_model_res_carbcef <- df_model_res_carbcef[ ,names(df_model_res_carbcef) %in% c(vars, "t_risk", "dttm_start", "entry_ips_dttm", "encounter_pseudo_id", "time", "event", "org_res", "new_res", "arm", "polym", "poly_bsi", "other") ] %>% filter(org_res=="S") %>% mutate( t_risk=as.numeric(t_risk, unit="days"),  across(urine:klebsiella_aerogenes | age, ~ifelse(is.na(.x), F, .x))) %>% mutate(I=new_res!="S") 
+
+# Emulate the target trial
+plots_res_carbcef=get_plots_glm(data=df_model_res_carbcef, outcome="I", title="Decreased susceptibility", xlab="OR: meropenem/cefepime", incl.t=T, method="glm", name_glm_coef="armmeropenem")
+
+```
+
+Combine the two plots and save them.
+```{r}
+#| echo: false
+
+# Combine the two plots using patchwork
+plot_carbcef = free(plots_res_carbcef$glm + theme(legend.position = "none"), type="label") + free(plots_30$glm + theme(legend.position = "none"), type="label") + plots_res_carbcef$smd +  plots_30$smd + plot_layout(tag_level="keep", axes="keep", heights=c(1, 4), guides="collect")
+
+# Save the plot
+ggsave(filename=paste0("carbcef", ".pdf"), plot=plot_carbcef, path=paste0(path, "/plots/ampc/cid/main_figures/", if(high_mutation){"high/"}else{""}), device="pdf", width =width*5/4, height=height*5/4, units="cm")
+
+```
+
+
+## Save the results as tables in Word documents.
+
+```{r}
+#| echo: false
+
+# We compute the summary statistics for the study populations and convert all the tables to LaTex.
+for(type in c("res", "rev", "rel", "res_carbcef", "30")){
+  
+  # Prepare the data
+  df_temp = get(paste0("df_model_", type))
+  p = get(paste0("plots_", type))
+  description=if(type=="res"){"new AmpC-like phenotype."}else if(type=="rev"){" persistence of AmpC-like phenotype."}else if(type=="res_carbcef"){"decreased suceptibility carbapenem vs. cefepime."}else if(type=="30"){"clinical failure"}else{"microbiological relapse."}
+  
+  # Table of the hazard ratios from the Fine-Gray models
+  #--------------------------------------------------
+  df_glm = p$glm_res %>% mutate(across(all_of(c("coef", "coef_l", "coef_u", "pvalue")), ~round(.x, 3)))
+  df_glm$OR = paste0(df_glm$coef, " (", df_glm$coef_l, "-", df_glm$coef_u, ")") 
+  
+  # Select for the final table
+  df_glm = df_glm[, c( "group", "OR", "pvalue")] 
+  
+  # Convert to xtables
+  tab_glm = df_glm %>% gt::gt() %>%
+     gt::tab_footnote( paste0("OR (odds ratios) with 95%-confidence intervals for ", description))
+  
+  # Table of population characteristic
+  #--------------------------------------------------
+  vars=c(materials, species, patient_encounter, imm_var_gen, if(type=="res"){"ampc"}else if(type=="rev"){"ampc_2"}else if(type=="res_carbcef"){"I"}else if(type=="30"){"clinical_30"}else{"relapse"}, "polym", "poly_bsi", "t_risk", "exp_risk")
+  
+  # Compute the summary statistics
+  tab_pop = df_temp %>% mutate(arm=as.factor(arm)) %>% tbl_summary(include = vars[vars %in% colnames(df_temp)], by=arm) %>% 
+    add_overall() %>% add_p() %>%  modify_spanning_header(c("stat_1", "stat_2")~"**Treatment Arm**") %>% 
+    as_gt()  %>% gt::tab_options(table.font.size = "small") %>%
+    gt::tab_footnote( paste0("Summary statistics of the study population for ", description))
+  
+  # Table of SMD before and after adjustment
+  #--------------------------------------------------
+  df_smd=p$smd_res %>% pivot_wider(names_from=group, values_from = SMD) 
+  tab_smd=df_smd %>% gt::gt() %>%
+     gt::tab_footnote( paste0("SMD (standardized mean differences) for ", description))
+  
+  # Save the tables in tex-files
+  gt::gtsave(tab_pop, file=paste0(path, "/plots/ampc/cid/tables/summary_", type, ".docx"))
+  gt::gtsave(tab_glm, file=paste0(path, "/plots/ampc/cid/tables/fg_", type, ".docx"))
+  gt::gtsave(tab_smd, file=paste0(path, "/plots/ampc/cid/tables/smd_", type, ".docx"))
+}  
+
+
+```
+
+
+# Additional analysis and stratifications
+
+## Change of Treatment
+
+Alluvial plot of the change of treatment arms, from empirical to definitve treatment.
+
+```{r}
+#| echo: false
+
+library(easyalluvial)
+
+# Prepare the dataframe
+df_arm_first=get_arm_outcome_2(t_start=hours(0), t_duration=hours(1), t_max=hours(48))
+df_arm_72h=get_arm_outcome_2(t_start=hours(72), t_duration=hours(48), t_max=days(5))
+
+# Combine the two dataframes
+df_change = df_arm_first %>%select(encounter_pseudo_id, arm) %>% mutate(t = 0) %>%
+  bind_rows(df_arm_72h %>% select(encounter_pseudo_id, arm) %>%  mutate(t = 72)) %>%
+  mutate(arm = recode(arm, "1" = "inducers", "2" = "carbapenems/cefepime",.default = "DNA inhibitors"), t = as.factor(t)) %>%
+  complete(encounter_pseudo_id, t, fill = list(arm = "not unique/discharged")) %>%
+  mutate(arm = as.factor(arm))
+
+# Alluvial plot
+col_alv = c( "#785ef0","#ffb000", "#dc267f", "#808080")  # colors for plotting
+
+plot_change=alluvial_long(df_change, key=t, value=arm, id=encounter_pseudo_id, order_levels_value = c("inducers", "carbapenems/cefepime", "DNA inhibitors"), col_vector_value = col_alv, col_vector_flow = col_alv, stratum_label_type="label") +
+  labs(x="time", y="count", title="Course of treatment")+
+  theme_light()+
+    theme(text=element_text(family=font, size=font_sz), plot.title = element_text(hjust=0.5), plot.caption=element_text(hjust=0, size=11), strip.background = element_rect(color="gray", fill="white"), strip.text = element_text(size=12, color="black"), legend.text = element_text(size=11)) +
+  scale_x_discrete(limits=c("0", "72"), labels = c("0" = "empirical", "72" = "definitive"))
+
+# Save the plot
+ggsave(filename="change.pdf", plot=plot_change, path=paste0(path, "/plots/ampc/cid/supplementary/", if(high_mutation){"high/"}else{""}), device="pdf", width =width, height=height, units="cm")
+
+```
+
+
+## Fraction days of treatment over days between tests
+
+```{r}
+#| echo: false
+
+#--------------------------------------------------
+# Preppare the dataframe
+#--------------------------------------------------
+
+# Add the key dates to the treatment dataframe and keep only relevant entries
+df_treat_dates = df_treat %>% left_join(df_model_res %>% select(encounter_pseudo_id, dttm_start, dttm_end), by="encounter_pseudo_id") %>%
+  mutate(t_end=difftime(dttm_end, dttm, unit="hours"), t_start=difftime(dttm, dttm_start, unit="hours")) %>%
+  filter(t_end>=hours(0) & t_start>=hours(0))
+
+# Initialize dataframe
+df_model_res_cont=df_model_res %>% mutate(first_adeq=0)
+t_max=80
+
+# Extract the daily treatment
+for(d in 1:t_max){
+  # Select the treatment of that days
+  df_treat_temp=df_treat_dates %>% filter(t_end < d*days(1) & t_end >= (d-1)*days(1)) %>%
+    summarise("day_{d}":=case_when(any(arm=="1")~ "1", any(arm=="2" | arm=="3")~"2", any(arm=="4")~"4", .default="none"), .by="encounter_pseudo_id") 
+
+  # Add the daily treatment to the dataframe
+  df_model_res_cont=df_model_res_cont %>% left_join(df_treat_temp, by="encounter_pseudo_id") %>%
+    mutate("day_{d}":=ifelse(is.na(get(paste0("day_", as.character(d)))), "none", get(paste0("day_", as.character(d)))))
+  
+  # Update the first_adeq column
+  df_model_res_cont=df_model_res_cont %>% mutate(first_adeq=if_else(first_adeq==0 & get(paste0("day_", as.character(d)))!="1", d, first_adeq))
+}
+
+# Replace the NA's and remove case with less than 1 day and more then 30 days
+df_model_exp=df_model_res_cont %>%  mutate(sum=rowSums(across(day_1:paste0("day_", t_max))=="1"), comp=(first_adeq!=sum+1))  %>% mutate(across(bmi:charlson | leukozyten:pct, ~ifelse(is.na(.x), median(.x, na.rm=T), .x))) %>%
+  mutate(exp_risk=sum/t_risk) %>% filter(t_risk>=1 & t_risk<=30)
+
+
+#--------------------------------------------------
+# Target trial emulation
+#--------------------------------------------------
+
+plots_exp=get_plots_glm(data=df_model_exp %>% select(-arm) %>% rename(arm=exp_risk), outcome="ampc", cont=T, name_glm_coef="arm", title="New AmpC-like phenotype", xlab="OR: exposure fraction")
+
+#--------------------------------------------------
+# Save the plots
+#--------------------------------------------------
+
+# Combine the two plots using patchwork
+plot_exp = free(plots_exp$glm + theme(legend.position = "none"), type="label") + plots_exp$smd + plot_layout(tag_level="keep", axes="keep", heights=c(1, 4), guides="collect")
+
+# Save the plot
+ggsave(filename=paste0("exposure", ".pdf"), plot=plot_exp, path=paste0(path, "/plots/ampc/cid/supplementary/", if(high_mutation){"high/"}else{""}), device="pdf", width =width*3/4, height=height*5/4, units="cm")
+
+```
+
+
+old stuff - may be delete after discussion of new results
+
+```{r}
+#| echo: false
+
+formula_weightit=as.formula(paste0("exp_risk ~ polym+ poly_bsi+", paste(patient_encounter, collapse="+"), "+", paste(materials[materials!="other"], collapse="+"), "+", paste(species, collapse="+") , "+",  paste(imm_var_gen, collapse="+"), "+ t_risk"))
+
+  
+# Compute the weights
+#--------------------------------------------------
+set.seed(12345)
+ipwt_temp=weightit(formula_weightit, method="gbm", stabilized=T, criterion="p.max", data=df_model_res_cont  %>% select(-pct))
+  
+formula_glm=as.formula(paste0("ampc", "~ exp_risk +", paste(materials[!(materials %in% c("female_reproductive_organs", "pus", "other"))], collapse="+"), "+", paste(species, collapse="+") , "+", paste(patient_encounter, collapse="+"), "+", paste(imm_var_gen, collapse="+"), "+ poly(t_risk,2)"))
+
+# Using the weightit package
+fit=glm_weightit(formula_glm, family=quasibinomial(link="logit"), data=df_model_res_cont  , weightit=ipwt_temp)
+summary(fit)
+
+summary(ipwt_temp)
+bal.tab(ipwt_temp)
+
+ggplot(df_model_res_cont %>% filter(t_risk<6), aes(x=t_risk))+
+  geom_histogram()
+
+
+#--------------------------------------------------  
+# Inlfuence of the time
+#--------------------------------------------------
+
+formula_weightit=as.formula(paste0("t_risk~ polym+ poly_bsi+sum+", paste(patient_encounter, collapse="+"), "+", paste(materials[materials!="other"], collapse="+"), "+", paste(species, collapse="+") , "+",  paste(imm_var_gen, collapse="+")))
+
+  
+set.seed(12345)
+ipwt_temp=weightit(formula_weightit, method="gbm", stabilized=T, criterion="p.max", data=df_model_res_cont %>% select(-pct))
+  
+formula_glm=as.formula(paste0("ampc", "~ poly(t_risk, 5) + sum +", paste(materials[!(materials %in% c("female_reproductive_organs", "pus", "other"))], collapse="+"), "+", paste(species, collapse="+") , "+", paste(patient_encounter, collapse="+"), "+", paste(imm_var_gen, collapse="+")))
+
+# Using the weightit package
+fit=glm_weightit(formula_glm, family=quasibinomial(link="logit"), data=df_model_res_cont, weightit=ipwt_temp)
+summary(fit)
+summary(ipwt_temp)
+bal.tab(ipwt_temp)
+
+```
+
+
+To remove the interweavement of time and days of treatment, we split the population into three parts.
+
+```{r}
+#| echo: false
+
+# compute the quantiles and stratify the data
+quant=quantile(df_model_exp$t_risk, probs=c(0.33, 0.67))
+df_model_res_quant=df_model_exp %>% mutate(quant=case_when(t_risk<=quant[1] ~ "1", t_risk>quant[1] & t_risk <quant[2]~"2", t_risk>quant[2]~"3")) %>% mutate(arm=sum)
+
+#  Choose the quantile
+q=2
+
+# Prepare the dataframes
+df_temp=df_model_res_quant %>% filter(quant==q) 
+  
+# Emulate the target trials and save the results
+assign(paste0("plots_q", q), get_plots_glm(data=df_temp, outcome="ampc", cont=T, name_glm_coef="arm", xlab="OR: days of treatment"))
+assign(paste0("plots_qt", q), get_plots_glm(data=df_temp %>% rename(arm=t_risk, t_risk=arm), outcome="ampc", cont=T, name_glm_coef="arm", xlab="OR: time at risk"))
+
+plots_res_cont=get_plots_glm(data=df_model_res_quant, outcome="ampc", cont=T, name_glm_coef="arm", xlab="OR: days of treatment")
+plots_res_t= get_plots_glm(data=df_model_res_quant, outcome="ampc", cont=T, name_glm_coef="arm", xlab="OR: time at risk")
+
+# Combine the two plots using patchwork
+plot_cum_2 = free(plots_q2$glm +theme(legend.position = "none"), type="label") + free(plots_qt2$glm +theme(legend.position = "none"), type="label") +
+  plots_q2$smd +  plots_qt2$smd + plot_layout(tag_level="keep", axes="keep", heights=c(1, 4), guides="collect")
+
+plot_cum_total = free(plots_res_cont$glm +theme(legend.position = "none"), type="label") + free(plots_res_t$glm+theme(legend.position = "none"), type="label") +
+  plots_res_cont$smd +  plots_res_t$smd + plot_layout(tag_level="keep", axes="keep", heights=c(1, 4), guides="collect")
+
+# Save the plots
+ggsave(filename=paste0("cummulative", ".pdf"), plot=plot_cum_total, path=paste0(path, "/plots/ampc/cid/supplementary/", if(high_mutation){"high/"}else{""}), device="pdf", width =width*5/4, height=height*5/4, units="cm")
+ggsave(filename=paste0("cummulative_q", as.character(q), ".pdf"), plot=plot_cum_2, path=paste0(path, "/plots/ampc/cid/supplementary/", if(high_mutation){"high/"}else{""}), device="pdf", width =width*5/4, height=height*5/4, units="cm")
+
+```  
