@@ -323,26 +323,6 @@ for(type in c("emp", "def", "comb")){
 
 ```
 
-!!!Remove later!!!
-Investigating the imbalance of the SOFA score
-
-```{r}
-#| echo: false
-
-df_temp=df_model_def %>% filter(ips & route=="iv") %>%
-  select(sofa, age, arm, charlson, leukozyten)
-
-
-ggplot(df_temp, aes(x=leukozyten, y=sofa)) +
-  geom_point() +
-  geom_density_2d() +
-  geom_density_2d_filled(alpha=0.5)+
-  facet_wrap(vars(arm))
-
-```
-
-
-
 
 Print the table with the summary statistics and numerical results to Word documents.
 
