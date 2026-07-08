@@ -4,7 +4,7 @@ This is the GitHub repository contains all the R scripts used to obtain the pres
 
 ## Abstract
 
-**Background:** Exposure to certain β-lactams can induce overexpression of chromosomally-encoded AmpC β-lactamase in ESCPM bacteria (Enterobacter cloacae, Klebsiella aerogenes, Serratia marcescens, Citrobacter freundii, Providencia spp., and Morganella morganii), decreasing susceptibility. While this mechanism is well understood, clinical impact and extent to which treatment drives resistance remains unclear due to lack of randomized controlled trials and confounding in observational studies.
+**Background:** Exposure to certain β-lactams can induce overexpression of chromosomally-encoded AmpC β-lactamases in ESCPM bacteria (Enterobacter cloacae, Klebsiella aerogenes, Serratia marcescens, Citrobacter freundii, Providencia spp., and Morganella morganii), decreasing susceptibility. While this mechanism is well understood, clinical impact and extent to which treatment drives resistance remains unclear due to lack of randomized controlled trials and confounding in observational studies.
 
 **Methods:** We emulate target trials using electronic health records of adult inpatients with ESCPM infections from a tertiary-care centre, comparing three strategies: (i) inadequate antibiotics (by AmpC hydrolysable β-lactams), (ii) carbapenems/cefepime, and (iii) DNA inhibitors. Outcomes include length of stay, in-hospital mortality, microbiological relapse, and phenotypic resistance. We adjusted for confounding by patient demographics, comorbidities, infection site, and severity using inverse probability weighting (IPW).
 
