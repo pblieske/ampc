@@ -16,8 +16,8 @@ lapply(packages, library, character.only=T)
 # Colorscheme used for the plots
 col = c( "#dc267f", "#785ef0",  "#ffb000")
 col_long=c("#648fff", "#785ef0", "#dc267f", "#fe6100", "#ffb000", "#000000", "#808080")
-col_lab=c("inadequate"= "#dc267f",  "carbapenem \n& cefepime"="#785ef0", "adequate"="#785ef0"  , "DNA inhibitors"="#ffb000", "meropenem"="#785ef0", "cefepime"="#ffb000")
-line_lab=c("inadequate"= "dashed",  "carbapenem \n& cefepime"="solid", "adequate"="solid"  , "DNA inhibitors"="solid", "meropenem"="solid", "cefepime"="solid")
+col_lab=c("AmpC-vulnerable"= "#dc267f",  "AmpC-stable"="#785ef0", "adequate"="#785ef0"  , "Non-beta lactam"="#ffb000", "meropenem"="#785ef0", "cefepime"="#ffb000")
+line_lab=c("AmpC-vulnerable"= "dashed",  "AmpC-stable"="solid", "adequate"="solid"  , "Non-beta lactam"="solid", "meropenem"="solid", "cefepime"="solid")
 
 # Choose the font
 loadfonts(device="all", quiet=T)
@@ -30,7 +30,7 @@ width=25
 height=15
 
 # Vector for adjusting the plot labels
-translate=c("TRUE"="", "arm"="", "_"=" ", "sofa"="SOFA", "ips"="ICU", "ind"="inducers", "anti"="", "inad before"="inadequate empirical", "other treat"="other treatment", "leukozyten"="leukocytes", "t risk"="time at risk", "neutrophile"="neutrophils", "lymphozyten"="lymphocytes", "polym"="polymicrobial", "poly bsi"="polymicrobial BSI", "crp"="CRP", "pct"="PCT", "bmi"="BMI")
+translate=c("TRUE"="", "arm"="", "_"=" ", "sofa"="SOFA", "ips"="ICU", "ind"="inducers", "anti"="", "inad before"="AmpC-vulnerable empirical", "other treat"="other treatment", "leukozyten"="leukocytes", "t risk"="time at risk", "neutrophile"="neutrophils", "lymphozyten"="lymphocytes", "polym"="polymicrobial", "poly bsi"="polymicrobial BSI", "crp"="CRP", "pct"="PCT", "bmi"="BMI")
 
 
 #--------------------------------------------------
@@ -91,7 +91,7 @@ get_anti_outcome=function(t_start=hours(48), t_duration=hours(24), t_max=hours(7
   df_arm=df_treat_first %>% filter(encounter_pseudo_id %in% enc_cont) %>%
     rename(dttm_start=dttm_first) %>% rename(anti=anti_def)
 
-  # Check if inadequate treatment has been given before
+  # Check if AmpC-vulnerable treatment has been given before
   enc_inad=df_treat %>% filter(arm=="1") %>% left_join(df_empirical %>% select(encounter_pseudo_id, dttm_test), by=c("encounter_pseudo_id")) %>%
     left_join(df_arm %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
     filter(dttm>=dttm_test & dttm<dttm_start) %>% pull(encounter_pseudo_id) %>% unique()
@@ -158,7 +158,7 @@ plot_surv=function(df, title, xmax=25, legend_sum=F, caption=F, carbfep=F, km=F)
       df=df %>% mutate(strata=factor(ifelse(strata=="arm=1", "inadaquate", "adqaute"), levels = c("inadaquate", "adqaute")))
     }
     else{
-      df=df %>% mutate(strata=factor(ifelse(strata=="arm=1", "inadequate", ifelse(strata=="arm=2", "carbapenem \n& cefepime", "DNA inhibitors")), levels=c("inadequate", "carbapenem \n& cefepime", "DNA inhibitors")))
+      df=df %>% mutate(strata=factor(ifelse(strata=="arm=1", "AmpC-vulnerable", ifelse(strata=="arm=2", "AmpC-stable", "Non-beta lactam")), levels=c("AmpC-vulnerable", "AmpC-stable", "Non-beta lactam")))
     }
   }  
   
@@ -183,9 +183,9 @@ plot_surv=function(df, title, xmax=25, legend_sum=F, caption=F, carbfep=F, km=F)
     p=ggplot(df %>% filter(state!="(s0)"), aes(time, estimate))+
       geom_line(aes(color=as.factor(strata), linetype = as.factor(strata)), linewidth=1, show.legend = T)+
       geom_ribbon(aes(ymin=conf.low, ymax=conf.high, fill=strata), alpha=0.2, show.legend = T)+
-      scale_fill_manual(values=col_lab, breaks=c("inadequate", "carbapenem \n& cefepime", "DNA inhibitors", "meropenem", "cefepime"), labels=c("inadequate", "carbapenem \n& cefepime", "DNA inhibitors", "meropenem", "cefepime"), drop=F, name=NULL) +
-      scale_color_manual(values = col_lab, breaks=c("inadequate", "carbapenem \n& cefepime", "DNA inhibitors", "meropenem", "cefepime"), labels=c("inadequate", "carbapenem \n& cefepime", "DNA inhibitors", "meropenem", "cefepime"), drop=F, name=NULL)+
-      scale_linetype_manual(values=line_lab, breaks=c("inadequate", "carbapenem \n& cefepime", "DNA inhibitors", "meropenem", "cefepime"), labels=c("inadequate", "carbapenem \n& cefepime", "DNA inhibitors", "meropenem", "cefepime"), drop=F, name=NULL)+
+      scale_fill_manual(values=col_lab, breaks=c("AmpC-vulnerable", "AmpC-stable", "Non-beta lactam", "meropenem", "cefepime"), labels=c("AmpC-vulnerable", "AmpC-stable", "Non-beta lactam", "meropenem", "cefepime"), drop=F, name=NULL) +
+      scale_color_manual(values = col_lab, breaks=c("AmpC-vulnerable", "AmpC-stable", "Non-beta lactam", "meropenem", "cefepime"), labels=c("AmpC-vulnerable", "AmpC-stable", "Non-beta lactam", "meropenem", "cefepime"), drop=F, name=NULL)+
+      scale_linetype_manual(values=line_lab, breaks=c("AmpC-vulnerable", "AmpC-stable", "Non-beta lactam", "meropenem", "cefepime"), labels=c("AmpC-vulnerable", "AmpC-stable", "Non-beta lactam", "meropenem", "cefepime"), drop=F, name=NULL)+
       xlim(0,xmax)+
       labs(y="probability", x="time (days)", title=title, fill="treatment arm", color="treatment arm")+
       facet_grid(rows=vars(state), scales="free_y")+
@@ -286,7 +286,7 @@ plot_smd=function(df_ipw, title="Sample balance", match=F, abs=F, cont=F){
   facet=c("CRP"="severity", "leukocytes"="severity", "charlson"="severity",   "ICU"="severity",  "BMI"="demographics", "age"="demographics", "sex W"="demographics", 
           "klebsiella aerogenes"="species", "providencia spp"="species", "enterobacter cloacae"="species", "citrobacter freundii"="species","morganella morganii"="species",  "serratia marcescens"="species",
           "installation"="infection site", "pus"="infection site", "invasive not specified"="infection site",  "bones joints"="infection site", "upper respiratory tract"="infection site", "abdomen"="infection site", "lower respiratory tract"="infection site", "blood"="infection site",  "urine"="infection site", "wound"="infection site", "other treatment"="infection site",
-          "time at risk"="", "PCT"="severity", "neutrophils"="severity", "SOFA"="severity", "lymphocytes"="severity", "il 6"="severity", "polymicrobial"="species", "polymicrobial BSI"="infection site", "other"="infection site", "inadequate empirical"="demographics")
+          "time at risk"="", "PCT"="severity", "neutrophils"="severity", "SOFA"="severity", "lymphocytes"="severity", "il 6"="severity", "polymicrobial"="species", "polymicrobial BSI"="infection site", "other"="infection site", "AmpC-vulnerable empirical"="demographics")
   
   # Prepare the dataframe for plotting
   if(!match & !cont){
@@ -331,12 +331,12 @@ plot_smd=function(df_ipw, title="Sample balance", match=F, abs=F, cont=F){
       switch = "y"
     ) +
     theme_light()+
-    theme(text=element_text(family=font, colour = "black", size=font_sz),axis.text.x = element_text(size=font_sz*3/4), axis.text.y=element_text(size=font_sz*3/4), plot.title = element_text(hjust=0.5, family=font, size=font_sz),
-          strip.background = element_blank(),  axis.title=element_text(size=font_sz*3/4), strip.text = element_text(colour="black", size=font_sz-1), strip.placement = "outside", 
+    theme(text=element_text(family=font, colour = "black", size=font_sz*3/4),axis.text.x = element_text(size=font_sz*3/4), axis.text.y=element_text(size=font_sz*3/4), plot.title = element_text(hjust=0.5, family=font, size=font_sz),
+          strip.background = element_blank(),  axis.title=element_text(size=font_sz*3/4), strip.text = element_text(colour="black", size=font_sz*3/4, face="bold"), strip.placement = "outside", 
           panel.spacing=unit(0, "lines"), strip.clip="off")+
     scale_color_manual(values=c(col[2], col[1]))+
     scale_shape_manual(values=c(19, 18))+
-    labs(x=if(!cont){TeX("SMD = \\tiny $(m_{adequate} - m_{inadequate})/sd$")}else{"Correlation"} , y="", title=title, colour="", shape="")
+    labs(x=if(!cont){TeX("SMD = \\tiny $(m_{adequate} - m_{AmpC-vulnerable})/sd$")}else{"Correlation"} , y="", title=title, colour="", shape="")
   
   return(list(plot=p, df=df_plot))
 }
@@ -390,19 +390,19 @@ get_finegray=function(data, weights=NULL, arm=c("2"), etypes=c("discharge", "dea
 # Help function for determine the AmpC like resistances
 #--------------------------------------------------
  
-AmpC=function(cro, caz){
-  # Function for summarizing the AmpC expression
-  
-  anti_codes=c("cro", "caz")
-  for(code in anti_codes){
-    assign(code, case_when(is.na(get(code)) ~  "S", T ~  get(code)))
-  }
-  
-  ampc_n=(cro=="R")+(caz=="R")
-  ampc=ampc_n>=1
-  
-  return(tibble(ampc_n=ampc_n, ampc=ampc))
-}
+# AmpC=function(cro, caz){
+#   # Function for summarizing the AmpC expression
+#   
+#   anti_codes=c("cro", "caz")
+#   for(code in anti_codes){
+#     assign(code, case_when(is.na(get(code)) ~  "S", T ~  get(code)))
+#   }
+#   
+#   ampc_n=(cro=="R")+(caz=="R")
+#   ampc=ampc_n>=1
+#   
+#   return(tibble(ampc_n=ampc_n, ampc=ampc))
+# }
 
 
 
@@ -469,7 +469,7 @@ get_arm_outcome_2=function(t_start=hours(48), t_duration=hours(24), t_max=hours(
   
   
   
-  # Check if inadequate treatment has been given before
+  # Check if AmpC-vulnerable treatment has been given before
   enc_inad=df_treat %>% filter(arm=="1") %>% left_join(df_empirical %>% select(encounter_pseudo_id, dttm_test), by=c("encounter_pseudo_id")) %>%
     left_join(df_arm %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
     filter(dttm>=dttm_test & dttm<dttm_start) %>% pull(encounter_pseudo_id) %>% unique()
@@ -537,6 +537,146 @@ get_arm_outcome_2=function(t_start=hours(48), t_duration=hours(24), t_max=hours(
     right_join(df_sofa_48, by=c("encounter_pseudo_id", "dttm")) %>% 
     select(encounter_pseudo_id, sofa) %>% summarise(sofa=mean(sofa), .by="encounter_pseudo_id")
 
+  # Add the sofa score to the dataframe
+  df_arm_cov=df_arm_cov %>% left_join(df_sofa_add, by="encounter_pseudo_id")
+  
+  
+  # Return the summary data frame
+  return(df_arm_cov)
+}
+
+
+get_arm_outcome_def=function(t_grace=hours(24), t_duration=hours(48), t_max=days(30), route="all"){
+  # This function returns the unique treatment arm under which each encounter was between t_start and t_max after the first positive test.
+  # Arguments:
+  #     t_grace: how much time after the susceptibility test is allowed to switch treatment
+  #     t_max: maximal duration after the test at which the treatment can start
+  #     t_duration: every 24h during t_duration, the treatment has to be administered and no other of the three arms
+  # Return: dataframe containing the arm, the ICU status and SOFA score at the start of the treatment
+  
+  
+  #--------------------------------------------------
+  # Determine the treatment arm
+  #--------------------------------------------------
+  
+  # Collect the treatment given after dttm_result
+  df_treat_after=df_treat %>% left_join(df_empirical %>% select(all_of(c("encounter_pseudo_id", "dttm_test", "dttm_result"))), by=c("encounter_pseudo_id")) %>%
+    filter(dttm>=dttm_result & dttm<=dttm_result+t_grace+t_duration & dttm<dttm_test+t_max)
+  
+  # Get the first treatment for each encounter
+  df_treat_first=df_treat_after %>% filter(arm!="4" & dttm<=dttm_test+t_max) %>% summarise(dttm_first=min(dttm), .by="encounter_pseudo_id") %>% 
+    left_join(df_treat_after, by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm_first==dttm)) %>% filter(arm!="4") %>%
+    select(dttm_first, encounter_pseudo_id, arm) %>% unique() %>% mutate(dttm_check=dttm_first+t_duration) %>% rename(arm_def=arm)
+  
+  # Check if other treatments were given
+  df_check= df_treat_after %>% filter(arm!="4") %>%
+    left_join(df_treat_first, by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm>=dttm_first, dttm<=dttm_check)) 
+  
+  enc_mult= df_check %>%
+    filter(arm!=arm_def) %>% pull(encounter_pseudo_id) %>% unique()
+  
+  # Check if the route is correct
+  if(route=="oral"){
+    enc_route=df_check %>% filter(arm==arm_def) %>% filter(!oral) %>%
+      pull(encounter_pseudo_id) %>% unique()
+  }else if(route=="iv"){
+    enc_route=df_check %>% filter(arm==arm_def) %>% filter(oral)  %>%
+      pull(encounter_pseudo_id) %>% unique()
+  }else{
+    enc_route=c()
+  }
+  
+  # Exclude encounter that have received any other treatment arm
+  df_treat_first=df_treat_first %>% filter(!(encounter_pseudo_id %in% enc_mult) & !(encounter_pseudo_id %in% enc_route))
+  print(paste0("Encounters excluded due to non unique treatment arm: ", as.character(length(enc_mult)), " \n Encounters exclude due to administration route: ", as.character(length(enc_route))))
+  
+  # Check if the treatment was given at least every 24h during t_duration
+  n_int=round(as.numeric(t_duration, unit="hours") / 24, digits=0)
+  enc_cont=df_treat_first %>% pull(encounter_pseudo_id) %>% unique()
+  
+  for(i in 1:max(n_int, 1)){
+    # Get all encounters that received the treatment again in 24h
+    enc_cont_up=df_treat_after %>% left_join(df_treat_first, by="encounter_pseudo_id") %>% 
+      filter(dttm>=dttm_first+(1-i)*hours(24) & dttm<=dttm_first+i*hours(24) & arm==arm_def) %>% 
+      pull(encounter_pseudo_id)
+    # Keep only the encounters that have received the treatment again
+    enc_cont=enc_cont[enc_cont %in% enc_cont_up]
+  }
+  
+  # Keep only the encounters that have continued the treatment
+  df_arm=df_treat_first %>% filter(encounter_pseudo_id %in% enc_cont) %>%
+    rename(dttm_start=dttm_first) %>% rename(arm=arm_def)
+  
+  
+  
+  # Check if AmpC-vulnerable treatment has been given before
+  enc_inad=df_treat %>% filter(arm=="1") %>% left_join(df_empirical %>% select(encounter_pseudo_id, dttm_test), by=c("encounter_pseudo_id")) %>%
+    left_join(df_arm %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
+    filter(dttm>=dttm_test & dttm<dttm_start) %>% pull(encounter_pseudo_id) %>% unique()
+  
+  # Check if other antibiotics have been administered
+  enc_4= df_treat_after %>% filter(arm=="4") %>%
+    left_join(df_treat_first, by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm>dttm_first, dttm<dttm_check)) %>%
+    pull(encounter_pseudo_id) %>% unique()
+  
+  # Add the information
+  df_arm=df_arm %>% mutate(inad_before=(encounter_pseudo_id %in% enc_inad), other_treat=(encounter_pseudo_id %in% enc_4))
+  
+  
+  #--------------------------------------------------
+  # Compute the outcome, incl. ICU admissions and current ICU status
+  #--------------------------------------------------
+  
+  df_icu=df_departement %>% filter(encounter_pseudo_id %in% df_arm$encounter_pseudo_id) %>%
+    group_by(encounter_pseudo_id) %>% arrange(entry_dttm) %>% mutate(discharge_dttm=lead(entry_dttm)) %>% ungroup() %>%
+    filter(departement_abbreviation!="DISCHARGE")
+  
+  # Movements between ICU and normal stations
+  by=join_by(encounter_pseudo_id==encounter_pseudo_id, dttm_start>=entry_dttm, dttm_start<discharge_dttm)
+  df_arm_cov=df_arm %>% left_join(df_icu, by) %>% left_join(df_empirical, by=c("encounter_pseudo_id")) %>% replace_na(list(ips=F))
+  
+  # New ICU admission afterwards
+  df_icu=df_departement %>% left_join(df_arm_cov %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
+    filter(entry_dttm>=dttm_start) %>% filter(ips) %>% summarise(entry_ips_dttm=min(entry_dttm), .by="encounter_pseudo_id") %>%
+    mutate(entry_ips_dttm=if_else(is.finite(entry_ips_dttm), entry_ips_dttm, NA))
+  
+  # Combine the dataframes
+  df_arm_cov=df_arm_cov %>% left_join(df_icu, by="encounter_pseudo_id")
+  
+  
+  #--------------------------------------------------
+  # Add the immunology data
+  #--------------------------------------------------
+  
+  # Filter for 72h before the test
+  df_imm_48=df_imm %>% left_join(df_arm_cov %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
+    filter(dttm<dttm_start, dttm>dttm_start - hours(72))
+  
+  # Keep the last test, convert to wide format
+  df_imm_add=df_imm_48 %>% summarise(dttm_last=max(dttm), .by=c("encounter_pseudo_id", "imm_code")) %>%
+    rename(dttm=dttm_last) %>%
+    right_join(df_imm_48, by=c("encounter_pseudo_id", "imm_code", "dttm")) %>% 
+    select(encounter_pseudo_id, imm_code, obs_val) %>% 
+    pivot_wider(values_from = obs_val, names_from = imm_code, values_fn=mean) 
+  
+  # Add the immunology data
+  df_arm_cov=df_arm_cov %>% left_join(df_imm_add, by="encounter_pseudo_id")
+  
+  
+  #--------------------------------------------------
+  # Add the SOFA score
+  #--------------------------------------------------
+  
+  # Filter for 72h before the test
+  df_sofa_48=df_sofa %>% left_join(df_arm_cov %>% select(encounter_pseudo_id, dttm_start), by="encounter_pseudo_id") %>%
+    filter(dttm<=dttm_start+hours(2), dttm>dttm_start - days(14))
+  
+  # Keep the last value
+  df_sofa_add=df_sofa_48 %>% summarise(dttm_last=max(dttm), .by=c("encounter_pseudo_id")) %>%
+    rename(dttm=dttm_last) %>%
+    right_join(df_sofa_48, by=c("encounter_pseudo_id", "dttm")) %>% 
+    select(encounter_pseudo_id, sofa) %>% summarise(sofa=mean(sofa), .by="encounter_pseudo_id")
+  
   # Add the sofa score to the dataframe
   df_arm_cov=df_arm_cov %>% left_join(df_sofa_add, by="encounter_pseudo_id")
   
